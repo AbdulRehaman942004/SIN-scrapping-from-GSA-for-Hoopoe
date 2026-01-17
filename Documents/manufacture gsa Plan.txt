@@ -1,0 +1,11 @@
+BI-SILQUE VISUAL COMMUNICATION PRODUCTS INC
+bisilque
+
+let me explain you one time more what i want to do, We have an excel file named "original_to_root.csv" in our project. These roots are generalized strings that i predicted will be a substring of any related manufecturer on the website.
+For example, we have a root "bisilque" and lets say the manufecturer listed on the website for it is "BI SILQUE" or "BI-SILQUE" or " BI-SILQUE VISUAL COMMUNICATION PRODUCTS" or " BI-SILQUE VISUAL COMMUNICATION PRODUCTS" or literally anything in the world that contain "biqilque"(our root for this manufecturer). So what i want to do is process the website manufectuer to covert it into a simple format that contain no special charactrs, no spaces, all lower case, no extra things just plain text in lower case. That resultant string must match with our root "bisilque" as bisilque will be a substring of that resultant string. THe resultant string i expect should be something like "bisilquevisualcommunicationproducts". So "bisilque" is a substring of "bisilquevisualcommunicationproducts" so the program realize that it is the right product with the right manufecturer. 
+Explaining you the full plan now for munufecturer matching:
+In the excel file "Complete automation of GSA work - Copy.xlsx" , when program is gonna process a product, it will check it's "Manufacturer Long Name" (a column with manufacturer names of each product). program picks this menufecturer name and then search it in the excel file: "original_to_root.csv". From here it gets its root.
+Now the products is searched on the website everything else happens as usual, the manufecturer for the product on website is then picked and processed like i told u before (like , "bisilquevisualcommunicationproducts") then that root come into play and we check it that root is a substring of this process menufecturer name? if yes, our menufecturer get matched.
+This is the whole story i have in mind to match menufectuer. Give your opinions on it, becuase the approch we are using for menufecturer matching right now is not working properly.
+
+

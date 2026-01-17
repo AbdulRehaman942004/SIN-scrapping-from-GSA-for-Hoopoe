@@ -1,0 +1,27 @@
+We have done two steps so far, as u can see i have numbered the folder names with initals 1,2 and 3. so 1 and 2 are done, now we are moving to step 3 that is scrapping. 
+My plan is that I have created links for all the products  in excel file that are listed on gsa websites so my scrapping program dont have to search them each time on the website. this reduces the average time to process each product. In the second step, i have delt manufacture problem. Now as we have the root name for each manufacture, we can match them with the manufacture name on website by using "inlcude" function (or whatever method you prefer). Btw my plan is to first covert each manufacture into lowercase, remove spaces, remove special chracaters, and then compare it with the root form that i created. This was the way that i think would be most effective to find the right product with the right manufacture. (you can give your opinions on that) Now one thing more that we have to match is the unit of the product. In our main excel file that is "essendant-product-list.xlsx" we have a column named "Unit of Measure" it contains the unit in which we need our products so if also need to be match with the product that we are picking from the website. So we have two things to match, manufacturer and unit of measure. Now what we going to scrap are three things, "Price", "Contractor" and "Contract#"
+We are gonna pull these three things against each product in a excel file. Now i have told you my whole plan, you can give alternative options and opinions.
+
+
+Which scraping approach do you prefer? (Selenium vs Requests vs Hybrid)
+ans: see which approch is being used in the folder: "preiously implemented scrapping" and apply that.
+How strict should matching be? (exact vs fuzzy)
+ans: fuzzy (but a little stricter one)
+What if multiple products match? (take first, best match, or all)
+ans: take top(first products always) Also to note, we have to scrap info of 3 products against each product name in excel.
+Rate limiting preferences? (how fast can we scrape?)
+Its upto you, whatever you think is best.
+
+good work, but there are some mistakes. Let me tell you the attributes of the 2nd product, then you have to go and check it on GSA website. This way you would learn the correct position of each attribute. 
+
+Item Stock Number-Butted(or product name): 7029005
+Mfr: AT-A-GLANCE
+Unit: EA
+Price: 33.15
+Contractor: SUPPLIES HOTLINE CORPORATION
+Contractor#: 47QSMS24D00A6
+
+Now go and check these attributes on the site to learn their positions. then i hope after learning position for one product, you can do it for all.
+
+
+
