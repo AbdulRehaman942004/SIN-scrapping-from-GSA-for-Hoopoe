@@ -1077,7 +1077,15 @@ class GSAScrapingAutomation:
         return None
     
     def row_has_two_sins(self, row):
-        """Check if row already has at least 2 SINs filled"""
+        """Check if row already has at least 2 SINs filled OR contains 'SIN not found' (already attempted)"""
+        # First check if any column has "SIN not found" - if so, skip this row
+        for col in ['SIN1', 'SIN2', 'SIN3']:
+            if col in row.index:
+                value = row[col]
+                if pd.notna(value) and str(value).strip().lower() == 'sin not found':
+                    return True  # Skip rows with "SIN not found"
+        
+        # Otherwise, check if row has at least 2 valid SINs
         sin_count = 0
         for col in ['SIN1', 'SIN2', 'SIN3']:
             if col in row.index:
@@ -2022,6 +2030,19 @@ class GSAScrapingAutomation:
                     print(f"\n{'='*80}")
                     print(f"🔄 [{offset}/{total}] Row {row_idx+1} | Item: {item_number}")
                     print(f"{'='*80}")
+                    
+                    # FIRST: Check if any SIN column contains "SIN not found" - skip immediately
+                    has_sin_not_found = False
+                    for col in ['SIN1', 'SIN2', 'SIN3']:
+                        val = row[col]
+                        if pd.notna(val) and str(val).strip().lower() == 'sin not found':
+                            has_sin_not_found = True
+                            break
+                    
+                    if has_sin_not_found:
+                        print(f"⏭️  Row contains 'SIN not found' - SKIPPING (already attempted)")
+                        logger.info(f"Row {row_idx+1} contains 'SIN not found', skipping")
+                        continue
                     
                     # Check how many SINs are already filled
                     existing_sins = []
