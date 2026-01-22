@@ -32,14 +32,23 @@ class GSAScrapingAutomation:
         # Pre-compile regex patterns for better performance
         self._compile_regex_patterns()
         
-        # Compile SIN extraction patterns - try multiple formats
-        # More specific patterns to avoid false matches
+        # Compile SIN extraction patterns - comprehensive formats
+        # Ordered from most specific to more general
         self._sin_patterns = [
-            re.compile(r'schedule[/\s]*sin[:\s]*[^\n]*?/([a-z0-9]{4,15})', re.IGNORECASE),  # "Schedule/SIN: MAS/332510C"
-            re.compile(r'sin[:\s]+([a-z0-9]{4,15})\b', re.IGNORECASE),  # "SIN: 332510C" (word boundary)
-            re.compile(r'schedule[:\s]+([a-z0-9]{4,15})\b', re.IGNORECASE),  # "Schedule: 332510C" (word boundary)
-            re.compile(r'(?:MAS|FSS)[/\s]+([0-9]{4,10}[A-Z]{0,3})\b', re.IGNORECASE),  # "MAS/332510C" or "FSS 332510"
-            re.compile(r'\b([0-9]{6}[A-Z])\b'),  # "332510C" format (6 digits + 1 letter)
+            # Format: "Schedule/SIN: MAS/332510C"
+            re.compile(r'schedule[/\s]*sin[:\s]*([A-Z]+)[/\s]+([A-Z0-9]{4,15})', re.IGNORECASE),
+            # Format: "Schedule/SIN MAS/332510C" (no colon)
+            re.compile(r'schedule[/\s]*sin\s+([A-Z]+)[/\s]+([A-Z0-9]{4,15})', re.IGNORECASE),
+            # Format: "SIN: 332510C" or "SIN 332510C"
+            re.compile(r'sin[:\s]+([A-Z0-9]{4,15})(?:\s|$|\n)', re.IGNORECASE),
+            # Format: "MAS/332510C" or "FSS/332510"
+            re.compile(r'\b(MAS|FSS|SIN)[/\s]+([0-9]{4,10}[A-Z]{0,3})\b', re.IGNORECASE),
+            # Format: Just the SIN number after "Schedule:"
+            re.compile(r'schedule[:\s]+([A-Z0-9]{4,15})(?:\s|$|\n)', re.IGNORECASE),
+            # Format: 6 digits + letter (e.g., "332510C")
+            re.compile(r'\b([0-9]{6}[A-Z]{1,3})\b'),
+            # Format: 5-7 digits alone
+            re.compile(r'\b([0-9]{5,7})\b'),
         ]
         
     def _create_unit_mapping(self):
@@ -116,7 +125,7 @@ class GSAScrapingAutomation:
             re.compile(r'each[:\s]*([a-z0-9\s]+)', re.IGNORECASE),
         ]
     
-    def setup_driver(self, headless=True):
+    def setup_driver(self, headless=False):
         """Initialize Chrome driver with optimized options for speed"""
         chrome_options = Options()
         
@@ -124,7 +133,7 @@ class GSAScrapingAutomation:
         if headless:
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--window-size=1920,1080")
-            print("🚀 Running in HEADLESS mode (faster for overnight runs)")
+            logger.info("Running in HEADLESS mode")
         
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
@@ -163,6 +172,9 @@ class GSAScrapingAutomation:
         
         self.driver = webdriver.Chrome(options=chrome_options)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Store headless mode setting for browser restarts
+        self._headless_mode = headless
         
         # Optimized timeouts for faster execution
         self.wait = WebDriverWait(self.driver, 10)  # Reduced from 15s
@@ -1075,67 +1087,78 @@ class GSAScrapingAutomation:
         return sin_count >= 2
     
     def extract_sin_from_product_page(self, product_url, max_attempts=2):
-        """Navigate to product detail page and extract SIN number"""
+        """Navigate to product detail page and extract SIN number - FAST & SIMPLE METHOD"""
         for attempt in range(max_attempts):
             try:
                 logger.info(f"Navigating to product page (attempt {attempt + 1}/{max_attempts}): {product_url}")
                 
-                # Navigate to product detail page
+                # Navigate and wait briefly
                 self.driver.get(product_url)
-                
-                # Wait for page to load - optimized for speed
-                time.sleep(1.5)  # Reduced from 2s
+                time.sleep(1.5)
                 
                 # Get page text
-                try:
-                    page_body = self.driver.find_element(By.TAG_NAME, "body")
-                    page_text = page_body.text
-                except Exception as e:
-                    logger.warning(f"Could not get page body text: {str(e)}")
-                    page_text = ""
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text
                 
-                if not page_text:
-                    logger.warning("Page text is empty!")
+                # STRATEGY 1: Simple text search with regex (FAST!)
+                patterns = [
+                    r'Schedule/SIN[:\s]+([A-Z0-9]+)/([A-Z0-9]+)',  # "Schedule/SIN: MAS/511210"
+                    r'Schedule/SIN[:\s]+([A-Z0-9]+)',               # "Schedule/SIN: 511210"
+                    r'SIN[:\s]+([A-Z0-9]+)/([A-Z0-9]+)',            # "SIN: MAS/511210"
+                    r'SIN[:\s]+([A-Z0-9]+)',                        # "SIN: 511210"
+                ]
+                
+                for pattern in patterns:
+                    matches = re.search(pattern, page_text, re.IGNORECASE)
+                    if matches:
+                        # If two groups (MAS/511210), take second one
+                        if len(matches.groups()) >= 2 and matches.group(2):
+                            sin_number = matches.group(2).upper()
+                            logger.info(f"✅ Found SIN: {sin_number}")
+                            print(f"      ✅ Found SIN: {sin_number}")
+                            return sin_number
+                        # If one group
+                        elif len(matches.groups()) == 1:
+                            full_sin = matches.group(1)
+                            if '/' in full_sin:
+                                sin_number = full_sin.split('/')[-1].strip().upper()
+                            else:
+                                sin_number = full_sin.strip().upper()
+                            logger.info(f"✅ Found SIN: {sin_number}")
+                            print(f"      ✅ Found SIN: {sin_number}")
+                            return sin_number
+                
+                # STRATEGY 2: Look in tables (backup method)
+                tables = self.driver.find_elements(By.TAG_NAME, "table")
+                for table in tables:
+                    rows = table.find_elements(By.TAG_NAME, "tr")
+                    for row in rows:
+                        row_text = row.text.lower()
+                        if 'schedule/sin' in row_text or 'schedule sin' in row_text:
+                            cells = row.find_elements(By.TAG_NAME, "td")
+                            for cell in cells:
+                                cell_text = cell.text.strip()
+                                if '/' in cell_text:
+                                    parts = cell_text.split('/')
+                                    if len(parts) >= 2:
+                                        sin_number = parts[-1].strip().upper()
+                                        if re.match(r'^[A-Z0-9]+$', sin_number, re.IGNORECASE):
+                                            logger.info(f"✅ Found SIN in table: {sin_number}")
+                                            print(f"      ✅ Found SIN in table: {sin_number}")
+                                            return sin_number
+                
+                # Retry if needed
+                if attempt < max_attempts - 1:
+                    logger.info(f"Retrying (attempt {attempt + 2}/{max_attempts})...")
+                    time.sleep(1)
                     continue
                 
-                # DEBUG: Log relevant portion of page text
-                schedule_search = re.search(r'(schedule.*?(?:\n.*?){0,3})', page_text, re.IGNORECASE | re.DOTALL)
-                if schedule_search:
-                    logger.debug(f"Found Schedule section: {schedule_search.group(1)[:200]}")
-                
-                # Try multiple SIN extraction patterns
-                for pattern_idx, pattern in enumerate(self._sin_patterns):
-                    sin_match = pattern.search(page_text)
-                    if sin_match:
-                        sin_value = sin_match.group(1).strip().upper()
-                        logger.info(f"Found SIN using pattern {pattern_idx + 1}: {sin_value}")
-                        
-                        # Validate SIN format (should be alphanumeric, typically 6-10 chars)
-                        if len(sin_value) >= 4 and len(sin_value) <= 15:
-                            return sin_value
-                        else:
-                            logger.warning(f"SIN '{sin_value}' seems invalid (length: {len(sin_value)}), trying next pattern...")
-                            continue
-                
-                # If no pattern matched, save page for debugging
-                logger.warning(f"No SIN found on product page: {product_url}")
-                page_excerpt = page_text[:500] if len(page_text) > 500 else page_text
-                logger.debug(f"Page text excerpt (first 500 chars): {page_excerpt}")
-                
-                # Save page HTML for debugging (first time only)
-                if attempt == 0:
-                    try:
-                        debug_filename = f"debug_no_sin_{int(time.time())}.html"
-                        with open(debug_filename, 'w', encoding='utf-8') as f:
-                            f.write(self.driver.page_source)
-                        logger.info(f"Saved page HTML to {debug_filename} for debugging")
-                    except Exception as debug_err:
-                        logger.debug(f"Could not save debug HTML: {str(debug_err)}")
-                
+                # No SIN found
+                logger.warning(f"No SIN found: {product_url}")
+                print(f"      ❌ Could not extract SIN")
                 return None
                     
             except Exception as e:
-                logger.error(f"Error extracting SIN from product page (attempt {attempt + 1}): {str(e)}")
+                logger.error(f"Error extracting SIN (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_attempts - 1:
                     time.sleep(1)
                     continue
@@ -1963,9 +1986,19 @@ class GSAScrapingAutomation:
                     print("\n❌ Operation cancelled by user.")
                     return False
             
-            # Setup web driver with headless mode for overnight runs
-            print("\n🌐 Setting up web driver (headless mode for faster execution)...")
-            self.setup_driver(headless=True)
+            # Setup web driver - ask user preference
+            print("\n🌐 Setting up web driver...")
+            
+            # Ask if user wants headless mode
+            headless_choice = input("Run in headless mode (faster, no browser window)? (yes/no, default=no): ").strip().lower()
+            use_headless = headless_choice in ['yes', 'y']
+            
+            if use_headless:
+                print("🚀 Running in HEADLESS mode (faster, browser hidden)")
+            else:
+                print("👁️  Running in VISIBLE mode (you can see the browser)")
+            
+            self.setup_driver(headless=use_headless)
             print("✅ Web driver initialized successfully!")
             
             successful_scrapes = 0
@@ -2083,9 +2116,11 @@ class GSAScrapingAutomation:
                     if offset % 100 == 0 and offset > 0:
                         try:
                             print(f"\n🔄 Restarting browser to prevent memory leaks...")
+                            # Remember if we're in headless mode
+                            was_headless = hasattr(self, '_headless_mode') and self._headless_mode
                             self.driver.quit()
                             time.sleep(2)
-                            self.setup_driver(headless=True)
+                            self.setup_driver(headless=was_headless)
                             print(f"✅ Browser restarted successfully")
                             logger.info(f"Browser restarted at product {offset}")
                         except Exception as restart_err:
