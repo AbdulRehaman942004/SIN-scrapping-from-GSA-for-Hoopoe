@@ -32,6 +32,16 @@ class GSAScrapingAutomation:
         # Pre-compile regex patterns for better performance
         self._compile_regex_patterns()
         
+        # Compile SIN extraction patterns - try multiple formats
+        # More specific patterns to avoid false matches
+        self._sin_patterns = [
+            re.compile(r'schedule[/\s]*sin[:\s]*[^\n]*?/([a-z0-9]{4,15})', re.IGNORECASE),  # "Schedule/SIN: MAS/332510C"
+            re.compile(r'sin[:\s]+([a-z0-9]{4,15})\b', re.IGNORECASE),  # "SIN: 332510C" (word boundary)
+            re.compile(r'schedule[:\s]+([a-z0-9]{4,15})\b', re.IGNORECASE),  # "Schedule: 332510C" (word boundary)
+            re.compile(r'(?:MAS|FSS)[/\s]+([0-9]{4,10}[A-Z]{0,3})\b', re.IGNORECASE),  # "MAS/332510C" or "FSS 332510"
+            re.compile(r'\b([0-9]{6}[A-Z])\b'),  # "332510C" format (6 digits + 1 letter)
+        ]
+        
     def _create_unit_mapping(self):
         """Create unit of measure standardization mapping"""
         return {
@@ -106,16 +116,22 @@ class GSAScrapingAutomation:
             re.compile(r'each[:\s]*([a-z0-9\s]+)', re.IGNORECASE),
         ]
     
-    def setup_driver(self):
+    def setup_driver(self, headless=True):
         """Initialize Chrome driver with optimized options for speed"""
         chrome_options = Options()
+        
+        # Headless mode for overnight runs (faster, less resource-intensive)
+        if headless:
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--window-size=1920,1080")
+            print("🚀 Running in HEADLESS mode (faster for overnight runs)")
+        
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--disable-plugins")
         chrome_options.add_argument("--disable-images")  # Don't load images for faster scraping
-        # Note: Keeping JavaScript and CSS enabled as GSA site likely needs them for product loading
         chrome_options.add_argument("--disable-web-security")
         chrome_options.add_argument("--disable-features=VizDisplayCompositor")
         chrome_options.add_argument("--disable-background-timer-throttling")
@@ -127,7 +143,12 @@ class GSAScrapingAutomation:
         chrome_options.add_argument("--disable-ipc-flooding-protection")
         chrome_options.add_argument("--memory-pressure-off")
         chrome_options.add_argument("--max_old_space_size=4096")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_argument("--disable-gpu")  # Faster rendering
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-default-browser-check")
+        
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_experimental_option("prefs", {
             "profile.default_content_setting_values": {
@@ -142,7 +163,10 @@ class GSAScrapingAutomation:
         
         self.driver = webdriver.Chrome(options=chrome_options)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        self.wait = WebDriverWait(self.driver, 15)
+        
+        # Optimized timeouts for faster execution
+        self.wait = WebDriverWait(self.driver, 10)  # Reduced from 15s
+        self.driver.set_page_load_timeout(25)  # Prevent hanging pages
         
     def load_manufacturer_mapping(self):
         """Load manufacturer root form mapping from CSV"""
@@ -413,6 +437,230 @@ class GSAScrapingAutomation:
         except Exception as e:
             logger.error(f"Error reading Excel file: {str(e)}")
             return None, None
+    
+    def scrape_gsa_page_for_sins(self, gsa_url, target_manufacturer, target_unit, max_sins=2):
+        """Scrape GSA page for SIN numbers by clicking on matching products"""
+        try:
+            # Verify driver is ready
+            if not self.driver:
+                logger.error("Driver is not initialized in scrape_gsa_page_for_sins!")
+                return []
+            
+            logger.info(f"Scraping GSA page for SINs: {gsa_url}")
+            
+            # Navigate to the GSA page - this MUST complete and wait
+            try:
+                self.driver.get(gsa_url)
+                logger.info(f"Page navigation initiated, waiting for page to load...")
+                
+                # Wait for page to be fully loaded
+                try:
+                    WebDriverWait(self.driver, 15).until(
+                        lambda driver: driver.execute_script("return document.readyState") == "complete"
+                    )
+                    logger.info("Page readyState is 'complete'")
+                except TimeoutException:
+                    logger.warning("Page readyState did not become 'complete' within timeout, continuing anyway")
+                
+                # Additional fixed wait to ensure dynamic content starts loading - optimized
+                time.sleep(0.8)  # Reduced for overnight optimization
+                
+                # Check for product elements
+                def any_product_element_present(driver):
+                    selectors = [
+                        (By.CSS_SELECTOR, ".productViewControl"),
+                        (By.CSS_SELECTOR, "app-ux-product-display-inline"),
+                        (By.CSS_SELECTOR, ".product-item"),
+                        (By.CSS_SELECTOR, ".result-item"),
+                        (By.CSS_SELECTOR, ".product"),
+                        (By.XPATH, "//div[contains(@class, 'product')]"),
+                        (By.XPATH, "//div[contains(@class, 'result')]")
+                    ]
+                    for selector_type, selector_value in selectors:
+                        try:
+                            elements = driver.find_elements(selector_type, selector_value)
+                            if elements:
+                                return True
+                        except:
+                            continue
+                    return False
+                
+                # Wait for products to appear
+                try:
+                    WebDriverWait(self.driver, 10).until(any_product_element_present)
+                    logger.info("Product elements detected - page is loaded")
+                except TimeoutException:
+                    logger.warning("No product elements found within 10 seconds")
+                    return []
+                
+            except Exception as nav_error:
+                logger.error(f"Error navigating to page {gsa_url}: {str(nav_error)}")
+                return []
+            
+            # Find products
+            products = self._find_product_elements()
+            
+            if not products:
+                logger.warning(f"No products found on page: {gsa_url}")
+                return []
+            
+            logger.info(f"Found {len(products)} products on page")
+            print(f"   📦 Found {len(products)} products on page - Looking for {max_sins} matching SIN(s)...")
+            
+            # Extract SINs from matching products
+            sins_collected = []
+            products_checked = 0
+            
+            # Check if first product is header text
+            start_index = 0
+            if len(products) > 0:
+                first_product_text = products[0].text.lower()
+                if any(header_indicator in first_product_text for header_indicator in [
+                    'name contract number price', 'contractor name', 'price low to high', 
+                    'view as grid', 'sort by', 'filter by'
+                ]):
+                    start_index = 1
+                    logger.info("Skipping first product as it appears to be header text")
+            
+            # Iterate through products and extract SINs from matching ones
+            # Strategy: Check ALL products on page until we collect the required number of SINs
+            i = start_index
+            
+            print(f"   📋 Checking up to {len(products)} products on page...")
+            
+            while i < len(products):
+                # Stop if we have 2 SINs
+                if len(sins_collected) >= max_sins:
+                    logger.info(f"Collected {max_sins} SINs, stopping...")
+                    break
+                
+                try:
+                    # Always re-check products list length (it might have changed after navigation)
+                    if i >= len(products):
+                        logger.debug(f"Product index {i} out of range (list has {len(products)} products), breaking...")
+                        break
+                    
+                    product_element = products[i]
+                    product_text = product_element.text.lower()
+                    product_num = i + 1
+                    
+                    # Extract manufacturer and unit for matching
+                    website_manufacturer = self._extract_manufacturer(product_text)
+                    website_unit = self._extract_unit(product_text)
+                    
+                    # Check if manufacturer and unit match
+                    manufacturer_match = self.fuzzy_match_manufacturer(target_manufacturer, website_manufacturer)
+                    unit_match = self.fuzzy_match_unit(target_unit, website_unit)
+                    
+                    products_checked += 1
+                    
+                    # Show progress every 20 products
+                    if products_checked % 20 == 0:
+                        print(f"   🔍 Checked {products_checked} products, found {len(sins_collected)}/{max_sins} SINs so far...")
+                    
+                    if manufacturer_match and unit_match:
+                        logger.info(f"Product {product_num} MATCHED: Clicking to extract SIN...")
+                        print(f"   ✅ Product {product_num} matched - Extracting SIN...")
+                        
+                        # Click product and extract SIN
+                        sin_value = self.click_product_and_extract_sin(product_element, product_num)
+                        
+                        if sin_value:
+                            sins_collected.append(sin_value)
+                            logger.info(f"Successfully extracted SIN {len(sins_collected)}/{max_sins}: {sin_value}")
+                            print(f"   🎯 SIN extracted: {sin_value}")
+                        else:
+                            logger.warning(f"Product {product_num} matched but no SIN found")
+                            print(f"   ⚠️  Product matched but SIN not found on detail page")
+                        
+                        # CRITICAL: Re-find products after navigation (DOM has changed)
+                        # Don't increment i yet - products list has been reset
+                        products = self._find_product_elements()
+                        
+                        # Skip products we've already checked by starting from where we left off
+                        # But since the list was refreshed, we need to stay at the same index
+                        # Actually, we need to start fresh from the beginning since we can't track which we checked
+                        # Let's just continue from next product
+                        i += 1
+                        continue
+                    else:
+                        logger.debug(f"Product {product_num} SKIPPED: Manufacturer match={manufacturer_match}, Unit match={unit_match}")
+                    
+                    i += 1
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing product {i+1}: {str(e)}")
+                    i += 1
+                    continue
+            
+            # If we still need more SINs and haven't checked all products, scroll to load more
+            if len(sins_collected) < max_sins and i >= len(products):
+                logger.info(f"Found {len(sins_collected)} SIN(s), need {max_sins - len(sins_collected)} more. Scrolling to load more products...")
+                print(f"   📜 Scrolling to load more products ({i}/{len(products)} checked so far)...")
+                # Scroll to load more products
+                try:
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    products = self._find_product_elements()
+                    logger.info(f"After scrolling, found {len(products)} products total")
+                    
+                    # Continue checking from where we left off
+                    while i < len(products):
+                        if len(sins_collected) >= max_sins:
+                            break
+                        
+                        if i >= len(products):
+                            break
+                        
+                        try:
+                            product_element = products[i]
+                            product_text = product_element.text.lower()
+                            product_num = i + 1
+                            
+                            website_manufacturer = self._extract_manufacturer(product_text)
+                            website_unit = self._extract_unit(product_text)
+                            
+                            manufacturer_match = self.fuzzy_match_manufacturer(target_manufacturer, website_manufacturer)
+                            unit_match = self.fuzzy_match_unit(target_unit, website_unit)
+                            
+                            products_checked += 1
+                            
+                            if manufacturer_match and unit_match:
+                                logger.info(f"Product {product_num} MATCHED after scroll: Clicking to extract SIN...")
+                                print(f"   ✅ Product {product_num} matched - Extracting SIN...")
+                                sin_value = self.click_product_and_extract_sin(product_element, product_num)
+                                if sin_value:
+                                    sins_collected.append(sin_value)
+                                    logger.info(f"Successfully extracted SIN {len(sins_collected)}/{max_sins}: {sin_value}")
+                                    print(f"   🎯 SIN extracted: {sin_value}")
+                                else:
+                                    print(f"   ⚠️  Product matched but SIN not found")
+                                products = self._find_product_elements()
+                            
+                            i += 1
+                        except Exception as e:
+                            logger.warning(f"Error processing product {i+1} after scroll: {str(e)}")
+                            i += 1
+                            continue
+                except Exception as e:
+                    logger.warning(f"Error during single scroll attempt: {str(e)}")
+            
+            # Log final result
+            if len(sins_collected) >= max_sins:
+                logger.info(f"✅ SIN extraction SUCCESS: Found {len(sins_collected)}/{max_sins} SINs from {products_checked} products checked")
+                print(f"   ✅ Successfully collected {len(sins_collected)}/{max_sins} SINs from {products_checked} products!")
+            elif len(sins_collected) > 0:
+                logger.info(f"⚠️  SIN extraction PARTIAL: Found {len(sins_collected)}/{max_sins} SINs from {products_checked} products checked")
+                print(f"   ⚠️  Found {len(sins_collected)}/{max_sins} SINs from {products_checked} products (could not find more)")
+            else:
+                logger.info(f"❌ SIN extraction FAILED: Found 0/{max_sins} SINs from {products_checked} products checked")
+                print(f"   ❌ No SINs found after checking {products_checked} products")
+            
+            return sins_collected
+            
+        except Exception as e:
+            logger.error(f"Error scraping SINs from GSA page {gsa_url}: {str(e)}")
+            return []
     
     def scrape_gsa_page(self, gsa_url, target_manufacturer, target_unit):
         """Scrape GSA page for product information with optimized strategy"""
@@ -816,6 +1064,143 @@ class GSAScrapingAutomation:
         
         return None
     
+    def row_has_two_sins(self, row):
+        """Check if row already has at least 2 SINs filled"""
+        sin_count = 0
+        for col in ['SIN1', 'SIN2', 'SIN3']:
+            if col in row.index:
+                value = row[col]
+                if pd.notna(value) and str(value).strip() != '' and str(value).strip().lower() not in ['nan', 'sin not found']:
+                    sin_count += 1
+        return sin_count >= 2
+    
+    def extract_sin_from_product_page(self, product_url, max_attempts=2):
+        """Navigate to product detail page and extract SIN number"""
+        for attempt in range(max_attempts):
+            try:
+                logger.info(f"Navigating to product page (attempt {attempt + 1}/{max_attempts}): {product_url}")
+                
+                # Navigate to product detail page
+                self.driver.get(product_url)
+                
+                # Wait for page to load - optimized for speed
+                time.sleep(1.5)  # Reduced from 2s
+                
+                # Get page text
+                try:
+                    page_body = self.driver.find_element(By.TAG_NAME, "body")
+                    page_text = page_body.text
+                except Exception as e:
+                    logger.warning(f"Could not get page body text: {str(e)}")
+                    page_text = ""
+                
+                if not page_text:
+                    logger.warning("Page text is empty!")
+                    continue
+                
+                # DEBUG: Log relevant portion of page text
+                schedule_search = re.search(r'(schedule.*?(?:\n.*?){0,3})', page_text, re.IGNORECASE | re.DOTALL)
+                if schedule_search:
+                    logger.debug(f"Found Schedule section: {schedule_search.group(1)[:200]}")
+                
+                # Try multiple SIN extraction patterns
+                for pattern_idx, pattern in enumerate(self._sin_patterns):
+                    sin_match = pattern.search(page_text)
+                    if sin_match:
+                        sin_value = sin_match.group(1).strip().upper()
+                        logger.info(f"Found SIN using pattern {pattern_idx + 1}: {sin_value}")
+                        
+                        # Validate SIN format (should be alphanumeric, typically 6-10 chars)
+                        if len(sin_value) >= 4 and len(sin_value) <= 15:
+                            return sin_value
+                        else:
+                            logger.warning(f"SIN '{sin_value}' seems invalid (length: {len(sin_value)}), trying next pattern...")
+                            continue
+                
+                # If no pattern matched, save page for debugging
+                logger.warning(f"No SIN found on product page: {product_url}")
+                page_excerpt = page_text[:500] if len(page_text) > 500 else page_text
+                logger.debug(f"Page text excerpt (first 500 chars): {page_excerpt}")
+                
+                # Save page HTML for debugging (first time only)
+                if attempt == 0:
+                    try:
+                        debug_filename = f"debug_no_sin_{int(time.time())}.html"
+                        with open(debug_filename, 'w', encoding='utf-8') as f:
+                            f.write(self.driver.page_source)
+                        logger.info(f"Saved page HTML to {debug_filename} for debugging")
+                    except Exception as debug_err:
+                        logger.debug(f"Could not save debug HTML: {str(debug_err)}")
+                
+                return None
+                    
+            except Exception as e:
+                logger.error(f"Error extracting SIN from product page (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                    continue
+                return None
+        
+        return None
+    
+    def click_product_and_extract_sin(self, product_element, product_num):
+        """Click on product name to navigate to detail page and extract SIN"""
+        try:
+            # Find clickable product link within the product element
+            # Try multiple selectors for product name/link
+            link_selectors = [
+                (By.CSS_SELECTOR, "a.product-link"),
+                (By.CSS_SELECTOR, "a[href*='product_detail']"),
+                (By.CSS_SELECTOR, "h3 a"),
+                (By.CSS_SELECTOR, "h4 a"),
+                (By.CSS_SELECTOR, ".product-title a"),
+                (By.CSS_SELECTOR, "a"),
+                (By.XPATH, ".//a[contains(@href, 'product_detail')]"),
+                (By.XPATH, ".//a[contains(@class, 'product')]"),
+            ]
+            
+            product_link = None
+            product_url = None
+            
+            for selector_type, selector_value in link_selectors:
+                try:
+                    links = product_element.find_elements(selector_type, selector_value)
+                    for link in links:
+                        href = link.get_attribute('href')
+                        if href and 'product_detail' in href:
+                            product_link = link
+                            product_url = href
+                            break
+                    if product_link:
+                        break
+                except:
+                    continue
+            
+            if not product_link or not product_url:
+                logger.warning(f"Product {product_num}: No product detail link found")
+                return None
+            
+            logger.info(f"Product {product_num}: Found detail link: {product_url}")
+            
+            # Extract SIN from product detail page
+            sin_value = self.extract_sin_from_product_page(product_url)
+            
+            # Navigate back to search results page
+            self.driver.back()
+            time.sleep(0.8)  # Optimized for overnight runs
+            
+            return sin_value
+            
+        except Exception as e:
+            logger.error(f"Error clicking product and extracting SIN: {str(e)}")
+            # Try to navigate back in case we're stuck
+            try:
+                self.driver.back()
+                time.sleep(2)
+            except:
+                pass
+            return None
+    
     def update_dataframe_with_results(self, df, row_idx, products_data):
         """Update dataframe with scraped product information"""
         try:
@@ -854,10 +1239,15 @@ class GSAScrapingAutomation:
             logger.error(f"Error creating backup: {str(e)}")
             return None
     
-    def cleanup_old_backups(self, output_file="essendant-product-list_with_gsa_scraped_data.xlsx", keep_last=5):
+    def cleanup_old_backups(self, output_file, keep_last=5):
         """Clean up old backup files, keeping only the most recent ones"""
         try:
-            backup_files = [f for f in os.listdir('.') if f.startswith(f"{output_file}.backup_")]
+            # Get directory and filename
+            file_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
+            file_name = os.path.basename(output_file)
+            
+            # Find backup files
+            backup_files = [f for f in os.listdir(file_dir) if f.startswith(f"{file_name}.backup_")]
             backup_files.sort(reverse=True)  # Sort by name (timestamp) descending
             
             # Keep only the most recent backups
@@ -865,7 +1255,8 @@ class GSAScrapingAutomation:
             
             for backup_file in files_to_delete:
                 try:
-                    os.remove(backup_file)
+                    backup_path = os.path.join(file_dir, backup_file)
+                    os.remove(backup_path)
                     logger.info(f"Cleaned up old backup: {backup_file}")
                 except Exception as e:
                     logger.warning(f"Could not delete backup {backup_file}: {str(e)}")
@@ -875,7 +1266,8 @@ class GSAScrapingAutomation:
     
     def save_results_to_excel(self, df):
         """Save the updated dataframe to Excel file with backup"""
-        output_file = "essendant-product-list_with_gsa_scraped_data.xlsx"
+        # Use the same file that was loaded (self.excel_file_path)
+        output_file = self.excel_file_path
         
         try:
             # Create backup if file exists
@@ -1286,6 +1678,462 @@ class GSAScrapingAutomation:
         
         return missing_rows
     
+    def run_sin_scraping_menu(self):
+        """Interactive menu for SIN scraping"""
+        scrapped_products_file = "../ScrappedProducts.xlsx"
+        
+        # Check if file exists
+        if not os.path.exists(scrapped_products_file):
+            print(f"\n❌ ERROR: {scrapped_products_file} not found!")
+            print(f"   Looking in: {os.path.abspath(scrapped_products_file)}")
+            return False
+        
+        while True:
+            print("\n" + "="*80)
+            print("🎯 SIN SCRAPING MENU")
+            print("="*80)
+            print("📁 Target file: ScrappedProducts.xlsx (parent folder)")
+            print("✅ Smart Logic: Skips rows with 2+ SINs, completes partial rows")
+            print("="*80)
+            print("1. Test Mode (First 10 products)")
+            print("2. Custom Range (Specify start and end row)")
+            print("3. Single Product (By Item Number)")
+            print("4. Resume from Row (Skip already processed)")
+            print("5. Full Automation (All products)")
+            print("6. Back to Main Menu")
+            print("="*80)
+            
+            try:
+                choice = input("Enter your choice (1-6): ").strip()
+                
+                if choice == "1":
+                    print("\n" + "="*60)
+                    print("🧪 TEST MODE - SIN SCRAPING")
+                    print("="*60)
+                    print("Processing first 10 products...")
+                    success = self.run_sin_scraping_range(0, 9)
+                    if success:
+                        print("\n✅ Test mode completed!")
+                    else:
+                        print("\n❌ Test mode failed!")
+                
+                elif choice == "2":
+                    print("\n" + "="*60)
+                    print("📏 CUSTOM RANGE MODE - SIN SCRAPING")
+                    print("="*60)
+                    
+                    # Get total rows
+                    try:
+                        df = pd.read_excel(scrapped_products_file)
+                        total_rows = len(df)
+                        print(f"Total products available: {total_rows}")
+                        
+                        start_row = int(input(f"Enter start row (1-{total_rows}): ")) - 1
+                        end_row = int(input(f"Enter end row ({start_row + 1}-{total_rows}): ")) - 1
+                        
+                        if start_row < 0 or end_row >= total_rows or start_row > end_row:
+                            print("❌ ERROR: Invalid range!")
+                            continue
+                        
+                        count = end_row - start_row + 1
+                        print(f"\n📊 Processing rows {start_row + 1}-{end_row + 1} ({count} products)...")
+                        
+                        success = self.run_sin_scraping_range(start_row, end_row)
+                        if success:
+                            print(f"\n✅ Custom range completed!")
+                        else:
+                            print(f"\n❌ Custom range failed!")
+                    
+                    except ValueError:
+                        print("❌ ERROR: Please enter valid numbers!")
+                        continue
+                
+                elif choice == "3":
+                    print("\n" + "="*60)
+                    print("🎯 SINGLE PRODUCT MODE - SIN SCRAPING")
+                    print("="*60)
+                    item_number = input("Enter Item Number: ").strip()
+                    
+                    if not item_number:
+                        print("❌ ERROR: Item number cannot be empty!")
+                        continue
+                    
+                    success = self.run_sin_scraping_single(item_number)
+                    if success:
+                        print(f"\n✅ Single product SIN scraping completed!")
+                    else:
+                        print(f"\n❌ Single product SIN scraping failed!")
+                
+                elif choice == "4":
+                    print("\n" + "="*60)
+                    print("▶️  RESUME MODE - SIN SCRAPING")
+                    print("="*60)
+                    
+                    try:
+                        df = pd.read_excel(scrapped_products_file)
+                        total_rows = len(df)
+                        print(f"Total products: {total_rows}")
+                        
+                        start_row = int(input(f"Resume from row (1-{total_rows}): ")) - 1
+                        
+                        if start_row < 0 or start_row >= total_rows:
+                            print("❌ ERROR: Invalid row number!")
+                            continue
+                        
+                        end_row = total_rows - 1
+                        count = end_row - start_row + 1
+                        print(f"\n📊 Processing rows {start_row + 1}-{end_row + 1} ({count} products)...")
+                        
+                        success = self.run_sin_scraping_range(start_row, end_row)
+                        if success:
+                            print(f"\n✅ Resume mode completed!")
+                        else:
+                            print(f"\n❌ Resume mode failed!")
+                    
+                    except ValueError:
+                        print("❌ ERROR: Please enter a valid number!")
+                        continue
+                
+                elif choice == "5":
+                    print("\n" + "="*60)
+                    print("🚀 FULL AUTOMATION MODE - SIN SCRAPING")
+                    print("="*60)
+                    
+                    try:
+                        df = pd.read_excel(scrapped_products_file)
+                        total_rows = len(df)
+                        
+                        print(f"⚠️  WARNING: This will process ALL {total_rows} products!")
+                        print(f"⏱️  Estimated time: ~{total_rows * 15 / 3600:.1f} hours")
+                        print("📊 Products with 2+ SINs will be skipped")
+                        
+                        confirm = input("\nContinue? (yes/no): ").strip().lower()
+                        if confirm not in ['yes', 'y']:
+                            print("❌ Full automation cancelled.")
+                            continue
+                        
+                        success = self.run_sin_scraping_range(0, total_rows - 1)
+                        if success:
+                            print(f"\n✅ Full automation completed!")
+                        else:
+                            print(f"\n❌ Full automation failed!")
+                    
+                    except Exception as e:
+                        print(f"❌ ERROR: {str(e)}")
+                        continue
+                
+                elif choice == "6":
+                    print("\nReturning to main menu...")
+                    return True
+                
+                else:
+                    print("❌ ERROR: Invalid choice! Please enter 1-6.")
+            
+            except KeyboardInterrupt:
+                print("\n\n⚠️  Operation cancelled by user.")
+                return True
+            except Exception as e:
+                print(f"\n❌ ERROR: {str(e)}")
+                continue
+    
+    def run_sin_scraping_single(self, item_number):
+        """Scrape SIN for a single product by Item Number"""
+        try:
+            scrapped_products_file = "../ScrappedProducts.xlsx"
+            
+            print(f"\n🔍 Searching for Item Number: {item_number}")
+            
+            # Load file
+            df = pd.read_excel(scrapped_products_file)
+            
+            # Find product
+            mask = df['Item Number'].astype(str).str.strip().str.lower() == str(item_number).strip().lower()
+            matches = df[mask]
+            
+            if matches.empty:
+                print(f"❌ ERROR: No product found with Item Number: {item_number}")
+                return False
+            
+            # Get row index
+            row_idx = matches.index[0]
+            print(f"✅ Found at Row {row_idx + 1}")
+            
+            # Process single row
+            return self.run_sin_scraping_range(row_idx, row_idx)
+        
+        except Exception as e:
+            logger.error(f"Error in single product SIN scraping: {str(e)}")
+            print(f"❌ ERROR: {str(e)}")
+            return False
+    
+    def run_sin_scraping_range(self, start_row, end_row):
+        """Scrape SINs for a specific range of rows"""
+        try:
+            scrapped_products_file = "../ScrappedProducts.xlsx"
+            
+            print("\n" + "="*80)
+            print("🎯 SIN NUMBER SCRAPING")
+            print("="*80)
+            print("📋 Scraping SIN numbers from GSA product detail pages")
+            print("📁 Target file: ScrappedProducts.xlsx (parent folder)")
+            print("✅ Skip logic: Products with 2+ SINs will be skipped")
+            print("="*80)
+            
+            if not os.path.exists(scrapped_products_file):
+                print(f"❌ ERROR: {scrapped_products_file} not found!")
+                logger.error(f"{scrapped_products_file} not found")
+                return False
+            
+            print(f"✅ Found: {os.path.abspath(scrapped_products_file)}")
+            
+            # Load manufacturer mapping
+            print("\n📂 Loading manufacturer mapping...")
+            if not self.load_manufacturer_mapping():
+                print("❌ ERROR: Failed to load manufacturer mapping")
+                return False
+            print("✅ Manufacturer mapping loaded successfully!")
+            
+            # Read Excel data from ScrappedProducts.xlsx
+            print("\n📊 Reading ScrappedProducts.xlsx...")
+            try:
+                df = pd.read_excel(scrapped_products_file)
+                logger.info(f"Loaded {len(df)} rows from {scrapped_products_file}")
+                print(f"✅ Loaded {len(df)} total rows")
+            except Exception as e:
+                print(f"❌ ERROR: Could not read {scrapped_products_file}: {str(e)}")
+                return False
+            
+            # Verify required columns exist
+            required_cols = ['Item Number', 'Manufacturer Long Name', 'Unit of Measure', 'Links', 'SIN1', 'SIN2', 'SIN3']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                print(f"❌ ERROR: Missing required columns: {missing_cols}")
+                logger.error(f"Missing columns: {missing_cols}")
+                return False
+            
+            print(f"✅ All required columns found")
+            
+            # Validate range
+            if start_row < 0 or end_row >= len(df) or start_row > end_row:
+                print(f"❌ ERROR: Invalid range {start_row}-{end_row} for {len(df)} rows")
+                return False
+            
+            # Get rows in range that need scraping
+            rows_to_scrape = []
+            for i in range(start_row, end_row + 1):
+                row = df.iloc[i]
+                if not self.row_has_two_sins(row):
+                    # Check if Links column is not empty
+                    if pd.notna(row['Links']) and str(row['Links']).strip() != '':
+                        rows_to_scrape.append(i)
+            
+            if not rows_to_scrape:
+                print(f"\n✅ All products in range (rows {start_row+1}-{end_row+1}) already have 2+ SINs!")
+                print("="*80)
+                return True
+            
+            total_in_range = end_row - start_row + 1
+            print(f"\n📋 Range: Rows {start_row+1}-{end_row+1} ({total_in_range} products)")
+            print(f"✅ Already complete: {total_in_range - len(rows_to_scrape)} rows")
+            print(f"🔄 Need scraping: {len(rows_to_scrape)} rows")
+            print(f"⏱️  Estimated time: ~{len(rows_to_scrape) * 15 / 60:.1f} minutes")
+            
+            # Show sample
+            if len(rows_to_scrape) <= 5:
+                print(f"\n📝 Rows to process:")
+                for idx in rows_to_scrape:
+                    item_num = df.at[idx, 'Item Number']
+                    sin1 = df.at[idx, 'SIN1'] if pd.notna(df.at[idx, 'SIN1']) else 'Empty'
+                    sin2 = df.at[idx, 'SIN2'] if pd.notna(df.at[idx, 'SIN2']) else 'Empty'
+                    print(f"   • Row {idx+1}: {item_num} (SIN1={sin1}, SIN2={sin2})")
+            else:
+                print(f"\n📝 Sample of rows to process (first 5):")
+                for idx in rows_to_scrape[:5]:
+                    item_num = df.at[idx, 'Item Number']
+                    sin1 = df.at[idx, 'SIN1'] if pd.notna(df.at[idx, 'SIN1']) else 'Empty'
+                    sin2 = df.at[idx, 'SIN2'] if pd.notna(df.at[idx, 'SIN2']) else 'Empty'
+                    print(f"   • Row {idx+1}: {item_num} (SIN1={sin1}, SIN2={sin2})")
+                print(f"   ... and {len(rows_to_scrape) - 5} more rows")
+            
+            # Ask for confirmation for large ranges
+            if len(rows_to_scrape) > 10:
+                print("\n" + "="*80)
+                confirm = input("❓ Continue with SIN scraping? (yes/no): ").strip().lower()
+                if confirm not in ['yes', 'y']:
+                    print("\n❌ Operation cancelled by user.")
+                    return False
+            
+            # Setup web driver with headless mode for overnight runs
+            print("\n🌐 Setting up web driver (headless mode for faster execution)...")
+            self.setup_driver(headless=True)
+            print("✅ Web driver initialized successfully!")
+            
+            successful_scrapes = 0
+            start_time = time.time()
+            total = len(rows_to_scrape)
+            
+            print("\n" + "="*80)
+            print("🚀 STARTING SIN SCRAPING")
+            print("="*80)
+            print(f"💾 Auto-save: Every 50 products")
+            print("="*80)
+            
+            for offset, row_idx in enumerate(rows_to_scrape, 1):
+                try:
+                    row = df.iloc[row_idx]
+                    item_number = row['Item Number']
+                    manufacturer = row['Manufacturer Long Name']
+                    unit_of_measure = row['Unit of Measure']
+                    gsa_url = row['Links']
+                    
+                    print(f"\n{'='*80}")
+                    print(f"🔄 [{offset}/{total}] Row {row_idx+1} | Item: {item_number}")
+                    print(f"{'='*80}")
+                    
+                    # Check how many SINs are already filled
+                    existing_sins = []
+                    existing_sin_details = []
+                    for col in ['SIN1', 'SIN2', 'SIN3']:
+                        val = row[col]
+                        if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() not in ['nan', 'sin not found']:
+                            sin_value = str(val).strip()
+                            existing_sins.append(sin_value)
+                            existing_sin_details.append(f"{col}={sin_value}")
+                    
+                    sins_needed = 2 - len(existing_sins)
+                    
+                    if existing_sins:
+                        print(f"📊 Existing SINs: {len(existing_sins)} ({', '.join(existing_sin_details)}) | Need: {sins_needed} more")
+                    else:
+                        print(f"📊 Existing SINs: 0 | Need: {sins_needed} SINs")
+                    
+                    if sins_needed <= 0:
+                        print(f"✅ Row already has 2+ SINs - SKIPPING")
+                        logger.info(f"Row {row_idx+1} already has {len(existing_sins)} SINs, skipping")
+                        continue
+                    
+                    # Start timing
+                    product_start_time = time.time()
+                    
+                    # Scrape SINs (only scrape what we need)
+                    print(f"🌐 Navigating to GSA page to scrape {sins_needed} SIN(s)...")
+                    sins_scraped = self.scrape_gsa_page_for_sins(gsa_url, manufacturer, unit_of_measure, max_sins=sins_needed)
+                    
+                    product_time = time.time() - product_start_time
+                    
+                    if sins_scraped:
+                        # Fill SIN columns
+                        sins_filled_count = 0
+                        sin_columns = ['SIN1', 'SIN2', 'SIN3']
+                        for col in sin_columns:
+                            if pd.isna(df.at[row_idx, col]) or str(df.at[row_idx, col]).strip() == '' or str(df.at[row_idx, col]).strip().lower() == 'nan':
+                                if sins_scraped:
+                                    df.at[row_idx, col] = sins_scraped.pop(0)
+                                    sins_filled_count += 1
+                                    if not sins_scraped:
+                                        break
+                        
+                        successful_scrapes += 1
+                        total_sins_for_row = len(existing_sins) + sins_filled_count
+                        
+                        if total_sins_for_row >= 2:
+                            if existing_sins:
+                                print(f"✅ SUCCESS! Completed row with {sins_filled_count} new SIN(s) [Total: {total_sins_for_row}/2] - Time: {product_time:.1f}s")
+                            else:
+                                print(f"✅ SUCCESS! Scraped {sins_filled_count} SIN(s) [Total: {total_sins_for_row}/2] - Time: {product_time:.1f}s")
+                        else:
+                            print(f"⚠️  PARTIAL! Scraped {sins_filled_count} new SIN(s) [Total: {total_sins_for_row}/2, need {2-total_sins_for_row} more] - Time: {product_time:.1f}s")
+                        logger.info(f"Successfully scraped {sins_filled_count} SINs for row {row_idx+1} (total now: {total_sins_for_row})")
+                    else:
+                        # Mark as "SIN not found" in empty columns
+                        for col in ['SIN1', 'SIN2', 'SIN3']:
+                            if pd.isna(df.at[row_idx, col]) or str(df.at[row_idx, col]).strip() == '' or str(df.at[row_idx, col]).strip().lower() == 'nan':
+                                df.at[row_idx, col] = 'SIN not found'
+                                sins_needed -= 1
+                                if sins_needed <= 0:
+                                    break
+                        
+                        print(f"⚠️  No SINs found - Marked as 'SIN not found' - Time: {product_time:.1f}s")
+                        logger.warning(f"No SINs found for row {row_idx+1}")
+                    
+                    # Calculate ETA
+                    elapsed_time = time.time() - start_time
+                    avg_time = elapsed_time / offset
+                    remaining = total - offset
+                    eta_minutes = (remaining * avg_time) / 60
+                    
+                    print(f"⏱️  Current: {product_time:.1f}s | Avg: {avg_time:.1f}s | ETA: {eta_minutes:.1f}min")
+                    print(f"📊 Success Rate: {(successful_scrapes/offset*100):.1f}% ({successful_scrapes}/{offset})")
+                    
+                    # Auto-save every 50 rows
+                    if offset % 50 == 0:
+                        print(f"\n💾 Auto-saving progress...")
+                        try:
+                            df.to_excel(scrapped_products_file, index=False)
+                            print(f"✅ Progress saved at row {row_idx+1}")
+                            logger.info(f"Auto-save completed at row {row_idx+1}")
+                        except Exception as e:
+                            print(f"⚠️  Auto-save failed: {str(e)}")
+                            logger.error(f"Auto-save error: {str(e)}")
+                    
+                    # Rate limiting - optimized for overnight runs
+                    time.sleep(0.5)  # Minimal delay, navigation already has waits
+                    
+                    # Automatic browser restart every 100 products to prevent memory leaks
+                    if offset % 100 == 0 and offset > 0:
+                        try:
+                            print(f"\n🔄 Restarting browser to prevent memory leaks...")
+                            self.driver.quit()
+                            time.sleep(2)
+                            self.setup_driver(headless=True)
+                            print(f"✅ Browser restarted successfully")
+                            logger.info(f"Browser restarted at product {offset}")
+                        except Exception as restart_err:
+                            logger.error(f"Browser restart error: {str(restart_err)}")
+                            print(f"⚠️  Browser restart failed, continuing with current session")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing row {row_idx+1}: {str(e)}")
+                    print(f"❌ ERROR processing row: {str(e)}")
+                    continue
+            
+            # Final save
+            print("\n" + "="*80)
+            print("💾 SAVING FINAL RESULTS")
+            print("="*80)
+            try:
+                df.to_excel(scrapped_products_file, index=False)
+                print("✅ All data saved successfully!")
+                logger.info("Final save completed")
+            except Exception as e:
+                print(f"❌ ERROR saving final results: {str(e)}")
+                logger.error(f"Final save error: {str(e)}")
+                return False
+            
+            # Statistics
+            total_time = time.time() - start_time
+            print("\n" + "="*80)
+            print("🎉 SIN SCRAPING COMPLETED!")
+            print("="*80)
+            print(f"📊 Final Statistics:")
+            print(f"   • Total rows processed: {total}")
+            print(f"   • ✅ Successful scrapes: {successful_scrapes} ({(successful_scrapes/total*100):.1f}%)")
+            print(f"   • ⚠️  No SINs found: {total - successful_scrapes}")
+            print(f"   • ⏱️  Total time: {total_time/60:.1f} minutes")
+            print(f"   • ⚡ Average speed: {total_time/total:.1f}s per product")
+            print("="*80)
+            logger.info(f"SIN scraping completed: {successful_scrapes}/{total} successful")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in SIN scraping automation: {str(e)}")
+            print(f"\n❌ FATAL ERROR: {str(e)}")
+            return False
+        finally:
+            if self.driver:
+                self.driver.quit()
+    
     def run_scraping_missing_only(self):
         """Scrape only rows with missing GSA data - EXACT same flow as run_scraping_custom_range"""
         try:
@@ -1515,18 +2363,34 @@ def main():
     print("Rate limited for stability")
     print("="*60)
     
-    # File paths
-    excel_file = "essendant-product-list_with_gsa_scraped_data.xlsx"
+    # File paths - Updated to use ScrappedProducts.xlsx in parent folder
+    # For Options 1-5 (old scraping modes), use essendant file if it exists
+    # For Option 6 (SIN scraping), always use ScrappedProducts.xlsx
+    essendant_excel_file = "essendant-product-list_with_gsa_scraped_data.xlsx"
+    scrapped_products_file = "../ScrappedProducts.xlsx"
     manufacturer_mapping_file = "../2 coverting mfr names into root form/coverting to root form/original_to_root.csv"
     
-    # Check if files exist
-    if not os.path.exists(excel_file):
-        print(f"ERROR: Excel file not found: {excel_file}")
+    # Check which Excel file to use
+    # For now, default to ScrappedProducts.xlsx since essendant file is deleted
+    if os.path.exists(scrapped_products_file):
+        excel_file = scrapped_products_file
+        print(f"✅ Using: ScrappedProducts.xlsx (parent folder)")
+    elif os.path.exists(essendant_excel_file):
+        excel_file = essendant_excel_file
+        print(f"✅ Using: essendant-product-list_with_gsa_scraped_data.xlsx (current folder)")
+    else:
+        print(f"❌ ERROR: No Excel file found!")
+        print(f"   Looked for:")
+        print(f"   - {scrapped_products_file}")
+        print(f"   - {essendant_excel_file}")
         return
     
     if not os.path.exists(manufacturer_mapping_file):
-        print(f"ERROR: Manufacturer mapping file not found: {manufacturer_mapping_file}")
+        print(f"❌ ERROR: Manufacturer mapping file not found: {manufacturer_mapping_file}")
         return
+    
+    print(f"✅ Manufacturer mapping: {manufacturer_mapping_file}")
+    print("="*60)
     
     # Display menu
     while True:
@@ -1538,11 +2402,12 @@ def main():
         print("3. Full Automation (All 19,590 products)")
         print("4. Single Product (by Item Stock Number-Butted)")
         print("5. Scrape Missing Rows Only (Re-scrape failed/empty rows)")
-        print("6. Exit")
+        print("6. SIN Scraping Mode (Extract SIN numbers from product pages)")
+        print("7. Exit")
         print("="*60)
         
         try:
-            choice = input("Enter your choice (1-6): ").strip()
+            choice = input("Enter your choice (1-7): ").strip()
             
             if choice == "1":
                 print("\nRunning TEST MODE (first 10 products)...")
@@ -1550,7 +2415,7 @@ def main():
                 success = automation.run_scraping_test_mode(10)
                 if success:
                     print("\nSUCCESS: Test scraping completed successfully!")
-                    print("All data saved to essendant-product-list_with_gsa_scraped_data.xlsx")
+                    print(f"All data saved to {os.path.basename(excel_file)}")
                 else:
                     print("\nERROR: Test scraping failed!")
                     
@@ -1578,7 +2443,7 @@ def main():
                     success = automation.run_scraping_custom_range(start_row, end_row)
                     if success:
                         print(f"\nSUCCESS: Custom range scraping completed successfully!")
-                        print("All data saved to essendant-product-list_with_gsa_scraped_data.xlsx")
+                        print(f"All data saved to {os.path.basename(excel_file)}")
                     else:
                         print(f"\nERROR: Custom range scraping failed!")
                         
@@ -1600,7 +2465,7 @@ def main():
                     success = automation.run_scraping_full()
                     if success:
                         print("\nSUCCESS: Full automation completed successfully!")
-                        print("All data saved to essendant-product-list_with_gsa_scraped_data.xlsx")
+                        print(f"All data saved to {os.path.basename(excel_file)}")
                     else:
                         print("\nERROR: Full automation failed!")
                 else:
@@ -1617,7 +2482,7 @@ def main():
                 success = automation.run_scraping_single(stock_query)
                 if success:
                     print("\nSUCCESS: Single product scraping completed!")
-                    print("All data saved to essendant-product-list_with_gsa_scraped_data.xlsx")
+                    print(f"All data saved to {os.path.basename(excel_file)}")
                 else:
                     print("\nERROR: Single product scraping failed!")
 
@@ -1631,16 +2496,21 @@ def main():
                 success = automation.run_scraping_missing_only()
                 if success:
                     print("\nSUCCESS: Missing rows scraping completed!")
-                    print("All data saved to essendant-product-list_with_gsa_scraped_data.xlsx")
+                    print(f"All data saved to {os.path.basename(excel_file)}")
                 else:
                     print("\nERROR: Missing rows scraping failed!")
 
             elif choice == "6":
+                print("\n🎯 OPENING SIN SCRAPING MENU...")
+                automation = GSAScrapingAutomation(excel_file, manufacturer_mapping_file)
+                automation.run_sin_scraping_menu()
+
+            elif choice == "7":
                 print("\nExiting...")
                 break
                 
             else:
-                print("ERROR: Invalid choice! Please enter 1, 2, 3, 4, 5, or 6.")
+                print("ERROR: Invalid choice! Please enter 1, 2, 3, 4, 5, 6, or 7.")
                 
         except KeyboardInterrupt:
             print("\n\nOperation cancelled by user.")
