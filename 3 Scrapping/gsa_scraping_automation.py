@@ -474,8 +474,9 @@ class GSAScrapingAutomation:
                 except TimeoutException:
                     logger.warning("Page readyState did not become 'complete' within timeout, continuing anyway")
                 
-                # Additional fixed wait to ensure dynamic content starts loading - optimized
-                time.sleep(0.8)  # Reduced for overnight optimization
+                # Additional fixed wait to ensure dynamic content starts loading
+                # Increased to prevent "Unexpected Error" from GSA (rate limiting)
+                time.sleep(2.5)  # Wait for page to stabilize and avoid GSA errors
                 
                 # Check for product elements
                 def any_product_element_present(driver):
@@ -1100,9 +1101,10 @@ class GSAScrapingAutomation:
             try:
                 logger.info(f"Navigating to product page (attempt {attempt + 1}/{max_attempts}): {product_url}")
                 
-                # Navigate and wait briefly
+                # Navigate and wait for page to load
                 self.driver.get(product_url)
-                time.sleep(1.5)
+                # Increased wait to prevent "Unexpected Error" from GSA
+                time.sleep(2.5)  # Wait for product detail page to load
                 
                 # Get page text
                 page_text = self.driver.find_element(By.TAG_NAME, "body").text
@@ -1218,7 +1220,8 @@ class GSAScrapingAutomation:
             
             # Navigate back to search results page
             self.driver.back()
-            time.sleep(0.8)  # Optimized for overnight runs
+            # Increased wait to prevent "Unexpected Error" from GSA when returning to search page
+            time.sleep(2.5)  # Wait for page to reload and stabilize
             
             return sin_value
             
@@ -1259,10 +1262,23 @@ class GSAScrapingAutomation:
             logger.error(f"Error updating dataframe row {row_idx}: {str(e)}")
     
     def create_backup(self, file_path):
-        """Create a timestamped backup of the file"""
+        """Create a timestamped backup of the file in dedicated backups folder"""
         try:
+            # Get directory and filename
+            file_dir = os.path.dirname(file_path) or '.'
+            filename = os.path.basename(file_path)
+            
+            # Create backups folder if it doesn't exist
+            backups_dir = os.path.join(file_dir, 'backups')
+            if not os.path.exists(backups_dir):
+                os.makedirs(backups_dir)
+                logger.info(f"Created backups directory: {backups_dir}")
+            
+            # Create backup with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = f"{file_path}.backup_{timestamp}"
+            backup_filename = f"{filename}.backup_{timestamp}"
+            backup_path = os.path.join(backups_dir, backup_filename)
+            
             shutil.copy2(file_path, backup_path)
             logger.info(f"Backup created: {backup_path}")
             return backup_path
@@ -1271,14 +1287,19 @@ class GSAScrapingAutomation:
             return None
     
     def cleanup_old_backups(self, output_file, keep_last=5):
-        """Clean up old backup files, keeping only the most recent ones"""
+        """Clean up old backup files in backups directory, keeping only the most recent ones"""
         try:
             # Get directory and filename
             file_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
             file_name = os.path.basename(output_file)
             
-            # Find backup files
-            backup_files = [f for f in os.listdir(file_dir) if f.startswith(f"{file_name}.backup_")]
+            # Backups folder
+            backups_dir = os.path.join(file_dir, 'backups')
+            if not os.path.exists(backups_dir):
+                return  # No backups folder yet
+            
+            # Find backup files in backups directory
+            backup_files = [f for f in os.listdir(backups_dir) if f.startswith(f"{file_name}.backup_")]
             backup_files.sort(reverse=True)  # Sort by name (timestamp) descending
             
             # Keep only the most recent backups
@@ -1286,7 +1307,7 @@ class GSAScrapingAutomation:
             
             for backup_file in files_to_delete:
                 try:
-                    backup_path = os.path.join(file_dir, backup_file)
+                    backup_path = os.path.join(backups_dir, backup_file)
                     os.remove(backup_path)
                     logger.info(f"Cleaned up old backup: {backup_file}")
                 except Exception as e:
@@ -2119,19 +2140,23 @@ class GSAScrapingAutomation:
                     print(f"⏱️  Current: {product_time:.1f}s | Avg: {avg_time:.1f}s | ETA: {eta_minutes:.1f}min")
                     print(f"📊 Success Rate: {(successful_scrapes/offset*100):.1f}% ({successful_scrapes}/{offset})")
                     
-                    # Auto-save every 50 rows
+                    # Auto-save every 50 rows (with backup)
                     if offset % 50 == 0:
-                        print(f"\n💾 Auto-saving progress...")
+                        print(f"\n💾 Auto-saving progress (with backup)...")
                         try:
-                            df.to_excel(scrapped_products_file, index=False)
-                            print(f"✅ Progress saved at row {row_idx+1}")
-                            logger.info(f"Auto-save completed at row {row_idx+1}")
+                            # Temporarily set excel file path for save function
+                            original_path = self.excel_file_path
+                            self.excel_file_path = scrapped_products_file
+                            self.save_results_to_excel(df)
+                            self.excel_file_path = original_path
+                            print(f"✅ Progress saved at row {row_idx+1} (backup created)")
+                            logger.info(f"Auto-save with backup completed at row {row_idx+1}")
                         except Exception as e:
                             print(f"⚠️  Auto-save failed: {str(e)}")
                             logger.error(f"Auto-save error: {str(e)}")
                     
-                    # Rate limiting - optimized for overnight runs
-                    time.sleep(0.5)  # Minimal delay, navigation already has waits
+                    # Rate limiting - prevent "Unexpected Error" from GSA
+                    time.sleep(2.0)  # Wait between products to avoid rate limiting errors
                     
                     # Automatic browser restart every 100 products to prevent memory leaks
                     if offset % 100 == 0 and offset > 0:
@@ -2153,14 +2178,18 @@ class GSAScrapingAutomation:
                     print(f"❌ ERROR processing row: {str(e)}")
                     continue
             
-            # Final save
+            # Final save (with backup)
             print("\n" + "="*80)
-            print("💾 SAVING FINAL RESULTS")
+            print("💾 SAVING FINAL RESULTS (with backup)")
             print("="*80)
             try:
-                df.to_excel(scrapped_products_file, index=False)
-                print("✅ All data saved successfully!")
-                logger.info("Final save completed")
+                # Temporarily set excel file path for save function
+                original_path = self.excel_file_path
+                self.excel_file_path = scrapped_products_file
+                self.save_results_to_excel(df)
+                self.excel_file_path = original_path
+                print("✅ All data saved successfully with backup!")
+                logger.info("Final save with backup completed")
             except Exception as e:
                 print(f"❌ ERROR saving final results: {str(e)}")
                 logger.error(f"Final save error: {str(e)}")
