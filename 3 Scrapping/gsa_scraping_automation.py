@@ -1107,8 +1107,19 @@ class GSAScrapingAutomation:
                 
                 # Navigate and wait for page to load
                 self.driver.get(product_url)
-                # Increased wait to prevent "Unexpected Error" from GSA
-                time.sleep(2.5)  # Wait for product detail page to load
+                
+                # Wait for page to be fully loaded
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        lambda driver: driver.execute_script("return document.readyState") == "complete"
+                    )
+                    logger.info("Product page readyState is 'complete'")
+                except:
+                    logger.warning("Product page readyState timeout, continuing anyway")
+                
+                # Additional wait to ensure product details are fully rendered
+                time.sleep(5.0)  # Stay longer on product detail page to let it fully load
+                logger.info("Waited for product details to render")
                 
                 # Get page text
                 page_text = self.driver.find_element(By.TAG_NAME, "body").text
