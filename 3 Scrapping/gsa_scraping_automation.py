@@ -476,7 +476,7 @@ class GSAScrapingAutomation:
                 
                 # Additional fixed wait to ensure dynamic content starts loading
                 # Increased to prevent "Unexpected Error" from GSA (rate limiting)
-                time.sleep(2.5)  # Wait for page to stabilize and avoid GSA errors
+                time.sleep(4.0)  # Stay longer on search page to stabilize and avoid GSA errors
                 
                 # Check for product elements
                 def any_product_element_present(driver):
@@ -519,6 +519,10 @@ class GSAScrapingAutomation:
             
             logger.info(f"Found {len(products)} products on page")
             print(f"   📦 Found {len(products)} products on page - Looking for {max_sins} matching SIN(s)...")
+            
+            # Stay on search page longer to avoid rate limiting
+            time.sleep(3.0)  # Additional wait on search page before processing products
+            logger.info("Waiting on search page to prevent rate limiting...")
             
             # Extract SINs from matching products
             sins_collected = []
@@ -613,7 +617,7 @@ class GSAScrapingAutomation:
                 # Scroll to load more products
                 try:
                     self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(2)
+                    time.sleep(4.0)  # Stay longer on search page after scrolling to prevent rate limiting
                     products = self._find_product_elements()
                     logger.info(f"After scrolling, found {len(products)} products total")
                     
@@ -1221,7 +1225,7 @@ class GSAScrapingAutomation:
             # Navigate back to search results page
             self.driver.back()
             # Increased wait to prevent "Unexpected Error" from GSA when returning to search page
-            time.sleep(2.5)  # Wait for page to reload and stabilize
+            time.sleep(4.0)  # Stay longer on search page after returning to prevent rate limiting
             
             return sin_value
             
