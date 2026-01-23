@@ -1117,12 +1117,61 @@ class GSAScrapingAutomation:
                 except:
                     logger.warning("Product page readyState timeout, continuing anyway")
                 
-                # Additional wait to ensure product details are fully rendered
-                time.sleep(5.0)  # Stay longer on product detail page to let it fully load
-                logger.info("Waited for product details to render")
+                # Initial wait for page structure
+                time.sleep(3.0)
+                
+                # CRITICAL: Scroll to trigger lazy-loaded content
+                logger.info("Scrolling to trigger lazy-loaded product details...")
+                try:
+                    # Scroll to middle of page
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
+                    time.sleep(2.0)
+                    
+                    # Scroll to bottom
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2.0)
+                    
+                    # Scroll back to top where product details are
+                    self.driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(2.0)
+                except Exception as scroll_err:
+                    logger.warning(f"Scrolling error: {str(scroll_err)}")
+                
+                # Wait for product details to be present (not just header/footer)
+                try:
+                    # Wait for tables or product detail content to appear
+                    WebDriverWait(self.driver, 15).until(
+                        lambda d: len(d.find_element(By.TAG_NAME, "body").text) > 2000
+                    )
+                    logger.info("Product details content loaded (page has substantial text)")
+                except:
+                    logger.warning("Product details may not be fully loaded (page has minimal content)")
+                
+                # Final wait to ensure everything is rendered
+                time.sleep(3.0)
                 
                 # Get page text
                 page_text = self.driver.find_element(By.TAG_NAME, "body").text
+                logger.info(f"Product page loaded with {len(page_text)} characters of text")
+                
+                # Check if page has actual product details (not just header/footer)
+                if len(page_text) < 1500:
+                    logger.warning(f"Product page has minimal content ({len(page_text)} chars) - likely only header/footer loaded")
+                    if attempt < max_attempts - 1:
+                        logger.info("Retrying page load due to insufficient content...")
+                        time.sleep(3)
+                        continue
+                    else:
+                        logger.error("Product details failed to load after all attempts")
+                        return None
+                
+                # Check if page contains product detail indicators
+                if 'schedule' not in page_text.lower() and 'sin' not in page_text.lower():
+                    logger.warning("Product page does not contain 'Schedule' or 'SIN' keywords - content may not be loaded")
+                    if attempt < max_attempts - 1:
+                        logger.info("Retrying page load due to missing product details...")
+                        time.sleep(3)
+                        continue
                 
                 # STRATEGY 1: Simple text search with regex (FAST!)
                 patterns = [
